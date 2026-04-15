@@ -1,0 +1,19 @@
+# Generated output
+output/
+
+# Input images (keep doodle_xs.jpg as default sample)
+inputs/*
+!inputs/doodle_xs.jpg
+
+# Source photos for tile extraction
+images/
+
+# Python
+__pycache__/
+*.pyc
+
+# Claude Code
+.claude/
+
+# macOS
+.DS_Store

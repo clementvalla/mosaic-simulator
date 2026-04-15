@@ -1,0 +1,5 @@
+TODO
+
+[ ] interface with variables and mode selection, loading and saving images
+[ ] save time it took to process in the info txt it saves with each image
+[ ] refactor (file is getting large)
