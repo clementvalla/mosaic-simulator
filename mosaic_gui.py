@@ -12,6 +12,9 @@ import dearpygui.dearpygui as dpg
 
 from mosaic import (
     load_tile_templates,
+    get_max_tile_size,
+    quantize_colors,
+    apply_color_influence,
     generate_report,
     build_mosaic_drift,
     build_mosaic_contour,
@@ -22,6 +25,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TILES_DIR = os.path.join(SCRIPT_DIR, "tiles", "raw")
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
 DEFAULT_IMAGE = os.path.join(SCRIPT_DIR, "inputs", "doodle_xs.jpg")
+
+MAX_TILE_PX = get_max_tile_size(TILES_DIR)
 
 MODES = ["drift", "contour", "flow"]
 MODE_LABELS = ["Opus Tessellatum (grid)", "Opus Vermiculatum (contour)", "Opus Musivum (flow)"]
@@ -37,6 +42,24 @@ _tex_counter = 0        # incremented each time we need a new texture size
 _cur_tex_tag = None     # tag of the currently active texture
 _tex_w = 0
 _tex_h = 0
+
+# Pan / zoom state
+_zoom = 1.0             # 1.0 = fit-to-window
+_pan_x = 0.0            # pan offset in screen pixels (from fitted center)
+_pan_y = 0.0
+_dragging = False
+_drag_start_x = 0.0
+_drag_start_y = 0.0
+_pan_start_x = 0.0
+_pan_start_y = 0.0
+
+
+def _reset_zoom_state():
+    """Reset zoom/pan state variables (does not update layout)."""
+    global _zoom, _pan_x, _pan_y
+    _zoom = 1.0
+    _pan_x = 0.0
+    _pan_y = 0.0
 
 
 def load_image_file(path):
@@ -121,6 +144,7 @@ def on_file_selected(sender, app_data):
         set_status(f"Failed to load: {os.path.basename(path)}")
         return
     input_image = img.astype(np.float32)
+    _reset_zoom_state()
     update_texture(img)
     set_status(f"Loaded: {os.path.basename(path)} ({img.shape[1]}x{img.shape[0]})")
 
@@ -154,70 +178,69 @@ def run_generate(preview=False):
     try:
         img_rgb = input_image.copy()
         mode_key = get_mode()
-        tessera_size = int(dpg.get_value("tessera_size"))
-        grout_width = int(dpg.get_value("grout_width"))
+        grout_width_base = int(dpg.get_value("grout_width"))
         size_jitter = dpg.get_value("size_jitter")
         rotation_jitter = dpg.get_value("rotation_jitter")
         color_variation = dpg.get_value("color_variation")
-        preview_max_size = int(dpg.get_value("preview_max_size"))
-        max_input_size = int(dpg.get_value("max_input_size"))
+        num_colors = int(dpg.get_value("num_colors"))
+        color_influence = dpg.get_value("color_influence")
+        tesserae_across = int(dpg.get_value("tesserae_across"))
+        render_pct = max(10, min(100, int(dpg.get_value("render_percentage"))))
         seed_val = int(dpg.get_value("seed_val"))
         drift_correction = int(dpg.get_value("drift_correction"))
         edge_threshold = dpg.get_value("edge_threshold")
         fill_style = _get_fill_style()
         flow_direction = _get_flow_direction()
 
-        effective_max = preview_max_size if preview else max_input_size
+        # Resample input to tesserae grid dimensions
         h, w = img_rgb.shape[:2]
-        if max(h, w) > effective_max:
-            scale = effective_max / max(h, w)
-            new_w, new_h = int(w * scale), int(h * scale)
-            img_rgb = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        tesserae_down = max(1, round(tesserae_across * h / w))
+        img_rgb = cv2.resize(img_rgb, (tesserae_across, tesserae_down), interpolation=cv2.INTER_AREA)
 
-        templates = None if preview else load_tile_templates(TILES_DIR, tessera_size)
+        # Color preprocessing: quantize palette, then apply influence
+        if num_colors > 0:
+            img_rgb = quantize_colors(img_rgb, max(1, min(128, num_colors)))
+        if color_influence < 1.0:
+            img_rgb = apply_color_influence(img_rgb, max(0.0, color_influence))
+
+        # Compute effective tessera px from tile resolution and render %
+        effective_tessera_px = max(3, int(MAX_TILE_PX * render_pct / 100))
+        effective_grout = round(grout_width_base * render_pct / 100)
+
+        templates = None if preview else load_tile_templates(TILES_DIR, effective_tessera_px)
         rng = np.random.default_rng(seed_val if seed_val != 0 else None)
         grout_color = [40, 40, 40]
 
         if mode_key == "drift":
             mosaic, count = build_mosaic_drift(
-                img_rgb, templates, tessera_size, grout_width, grout_color,
+                img_rgb, templates, effective_tessera_px, effective_grout, grout_color,
                 color_variation, size_jitter, rotation_jitter, drift_correction, rng,
                 preview=preview,
             )
         elif mode_key == "contour":
             mosaic, count = build_mosaic_contour(
-                img_rgb, templates, tessera_size, grout_width, grout_color,
+                img_rgb, templates, effective_tessera_px, effective_grout, grout_color,
                 color_variation, size_jitter, rotation_jitter, edge_threshold, rng,
                 fill_style=fill_style, preview=preview,
             )
         elif mode_key == "flow":
             mosaic, count = build_mosaic_flow(
-                img_rgb, templates, tessera_size, grout_width, grout_color,
+                img_rgb, templates, effective_tessera_px, effective_grout, grout_color,
                 color_variation, size_jitter, rotation_jitter, rng,
                 flow_direction=flow_direction, preview=preview,
             )
 
         output_image = mosaic.astype(np.uint8)
+        _reset_zoom_state()
         update_texture(output_image)
-
-        saved_path = None
-        if not preview:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_name = f"gui_{mode_key}_{ts}.png"
-            saved_path = os.path.join(OUTPUT_DIR, out_name)
-            Image.fromarray(output_image).save(saved_path)
 
         report = generate_report(
             "gui_input", img_rgb.shape, mosaic.shape, count,
-            tessera_size, grout_width, 10.0, 1.0, mode_key,
+            effective_tessera_px, effective_grout, 10.0, 1.0, mode_key,
         )
-        if saved_path:
-            report += f"\nSaved to: {saved_path}"
-
         dpg.set_value("report_text", report)
-        tag = "[preview]" if preview else "[saved]"
-        set_status(f"{tag} {count} tesserae, {mosaic.shape[1]}x{mosaic.shape[0]}px")
+        tag = "[preview]" if preview else "[render]"
+        set_status(f"{tag} {count} tesserae ({tesserae_across}x{tesserae_down}), {mosaic.shape[1]}x{mosaic.shape[0]}px")
 
     except Exception as e:
         set_status(f"Error: {e}")
@@ -231,6 +254,26 @@ def on_preview():
 
 def on_render():
     threading.Thread(target=run_generate, args=(False,), daemon=True).start()
+
+
+def on_save():
+    """Save the current output image to disk."""
+    if output_image is None:
+        set_status("Nothing to save — render first.")
+        return
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    mode_key = get_mode()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_name = f"gui_{mode_key}_{ts}.png"
+    saved_path = os.path.join(OUTPUT_DIR, out_name)
+    Image.fromarray(output_image).save(saved_path)
+    # Also save report alongside
+    report = dpg.get_value("report_text")
+    if report:
+        report_path = os.path.splitext(saved_path)[0] + "_report.txt"
+        with open(report_path, "w") as f:
+            f.write(report)
+    set_status(f"[saved] {saved_path}")
 
 
 def on_mode_change():
@@ -321,14 +364,17 @@ with dpg.window(
     dpg.add_spacer(height=2)
 
     with dpg.group(horizontal=True):
-        dpg.add_button(label="Preview", callback=on_preview, width=PANEL_W // 2 - 14)
-        btn_render = dpg.add_button(label="Render", callback=on_render, width=-1)
+        dpg.add_button(label="Preview", callback=on_preview, width=PANEL_W // 3 - 12)
+        btn_render = dpg.add_button(label="Render", callback=on_render, width=PANEL_W // 3 - 12)
         dpg.bind_item_theme(btn_render, render_theme)
+        btn_save = dpg.add_button(label="Save", callback=on_save, width=-1)
+        dpg.bind_item_theme(btn_save, render_theme)
 
     dpg.add_spacer(height=2)
     with dpg.group(horizontal=True):
-        dpg.add_button(label="Show Input", callback=lambda: show_input(), width=PANEL_W // 2 - 14)
-        dpg.add_button(label="Show Output", callback=lambda: show_output(), width=-1)
+        dpg.add_button(label="Show Input", callback=lambda: show_input(), width=PANEL_W // 3 - 12)
+        dpg.add_button(label="Show Output", callback=lambda: show_output(), width=PANEL_W // 3 - 12)
+        dpg.add_button(label="Fit", callback=lambda: reset_view(), width=-1)
 
     dpg.add_spacer(height=4)
     dpg.add_text("Ready", tag="status_text", color=(136, 204, 255))
@@ -339,10 +385,19 @@ with dpg.window(
                   label="Mode", callback=lambda: on_mode_change(), width=-90)
     dpg.add_spacer(height=2)
 
+    # Scale
+    if dpg.add_collapsing_header(label="Scale", default_open=True):
+        dpg.add_slider_int(tag="tesserae_across", label="Across", default_value=50,
+                           min_value=10, max_value=300, width=-90)
+        dpg.add_slider_int(tag="render_percentage", label="Render %", default_value=100,
+                           min_value=10, max_value=100, width=-90)
+        dpg.add_text(f"Tile resolution: {MAX_TILE_PX}px", tag="tile_res_text",
+                     color=(160, 160, 160))
+        dpg.add_input_int(tag="seed_val", label="Seed (0=rand)", default_value=0,
+                          step=1, width=-90)
+
     # Tessera
     if dpg.add_collapsing_header(label="Tessera", default_open=True):
-        dpg.add_slider_int(tag="tessera_size", label="Size", default_value=30,
-                           min_value=5, max_value=100, width=-90)
         dpg.add_slider_int(tag="grout_width", label="Grout", default_value=-1,
                            min_value=-10, max_value=20, width=-90)
         dpg.add_slider_float(tag="size_jitter", label="Size Jitter", default_value=0.15,
@@ -352,17 +407,13 @@ with dpg.window(
 
     # Color
     if dpg.add_collapsing_header(label="Color", default_open=True):
+        dpg.add_slider_float(tag="color_influence", label="Influence", default_value=1.0,
+                             min_value=0.0, max_value=1.0, format="%.2f", width=-90)
+        dpg.add_slider_int(tag="num_colors", label="Palette", default_value=0,
+                           min_value=0, max_value=128, width=-90)
+        dpg.add_text("0 = unlimited colors", color=(160, 160, 160))
         dpg.add_slider_float(tag="color_variation", label="Variation", default_value=15.0,
                              min_value=0.0, max_value=50.0, format="%.0f", width=-90)
-
-    # Scale
-    if dpg.add_collapsing_header(label="Scale", default_open=True):
-        dpg.add_slider_int(tag="preview_max_size", label="Preview px", default_value=100,
-                           min_value=40, max_value=300, width=-90)
-        dpg.add_slider_int(tag="max_input_size", label="Render px", default_value=500,
-                           min_value=100, max_value=2000, width=-90)
-        dpg.add_input_int(tag="seed_val", label="Seed (0=rand)", default_value=0,
-                          step=1, width=-90)
 
     # Mode-specific options
     if dpg.add_collapsing_header(label="Mode Options", default_open=True):
@@ -399,24 +450,105 @@ if os.path.exists(DEFAULT_IMAGE):
 dpg.set_primary_window("primary_window", True)
 
 
-def resize_callback():
-    """Letterbox the canvas image to fill viewport without distortion."""
+def _get_canvas_area():
+    """Return (panel_right, avail_w, avail_h) for the image display area."""
     vw = dpg.get_viewport_client_width()
     vh = dpg.get_viewport_client_height()
+    panel_right = PANEL_W + 20
+    return panel_right, max(1, vw - panel_right), vh
+
+
+def resize_callback():
+    """Letterbox the canvas image with pan/zoom in the area right of the panel."""
+    panel_right, avail_w, avail_h = _get_canvas_area()
     if _tex_w <= 1 or _tex_h <= 1:
-        dpg.configure_item("canvas_image", width=vw, height=vh)
+        dpg.configure_item("canvas_image", width=avail_w, height=avail_h,
+                           pos=[panel_right, 0])
         return
-    # Fit image inside viewport preserving aspect ratio
-    scale = min(vw / _tex_w, vh / _tex_h)
+    # Base fit scale (zoom=1.0 means fit-to-window)
+    fit_scale = min(avail_w / _tex_w, avail_h / _tex_h)
+    scale = fit_scale * _zoom
     iw = int(_tex_w * scale)
     ih = int(_tex_h * scale)
-    # Center with offset
-    ox = (vw - iw) // 2
-    oy = (vh - ih) // 2
-    dpg.configure_item("canvas_image", width=iw, height=ih, pos=[ox, oy])
+    # Center within available area, then apply pan offset
+    ox = panel_right + (avail_w - iw) / 2 + _pan_x
+    oy = (avail_h - ih) / 2 + _pan_y
+    dpg.configure_item("canvas_image", width=iw, height=ih, pos=[int(ox), int(oy)])
+
+
+def reset_view():
+    """Reset zoom and pan to fit-to-window."""
+    global _zoom, _pan_x, _pan_y
+    _zoom = 1.0
+    _pan_x = 0.0
+    _pan_y = 0.0
+    resize_callback()
 
 
 dpg.set_viewport_resize_callback(lambda s, d: resize_callback())
+
+# ── Mouse handlers for pan / zoom ──
+
+def _on_mouse_wheel(sender, app_data):
+    """Zoom with scroll wheel, centered on mouse position."""
+    global _zoom, _pan_x, _pan_y
+    # app_data is scroll delta (positive = up = zoom in)
+    mx, my = dpg.get_mouse_pos(local=False)
+    panel_right, avail_w, avail_h = _get_canvas_area()
+    # Only zoom when mouse is in the canvas area
+    if mx < panel_right:
+        return
+    # Zoom factor
+    factor = 1.15 if app_data > 0 else 1.0 / 1.15
+    new_zoom = max(0.1, min(50.0, _zoom * factor))
+    # Adjust pan so the point under the cursor stays fixed
+    # Current center of image in screen coords (before zoom)
+    cx = panel_right + avail_w / 2 + _pan_x
+    cy = avail_h / 2 + _pan_y
+    # Vector from center to mouse
+    dx = mx - cx
+    dy = my - cy
+    # After zoom, scale that vector by the ratio
+    ratio = new_zoom / _zoom
+    _pan_x += dx - dx * ratio
+    _pan_y += dy - dy * ratio
+    _zoom = new_zoom
+    resize_callback()
+
+
+def _on_middle_down(sender, app_data):
+    """Start panning with middle mouse button."""
+    global _dragging, _drag_start_x, _drag_start_y, _pan_start_x, _pan_start_y
+    mx, my = dpg.get_mouse_pos(local=False)
+    _dragging = True
+    _drag_start_x = mx
+    _drag_start_y = my
+    _pan_start_x = _pan_x
+    _pan_start_y = _pan_y
+
+
+def _on_middle_up(sender, app_data):
+    global _dragging
+    _dragging = False
+
+
+def _on_mouse_move(sender, app_data):
+    """Update pan while dragging."""
+    global _pan_x, _pan_y
+    if not _dragging:
+        return
+    mx, my = dpg.get_mouse_pos(local=False)
+    _pan_x = _pan_start_x + (mx - _drag_start_x)
+    _pan_y = _pan_start_y + (my - _drag_start_y)
+    resize_callback()
+
+
+with dpg.handler_registry():
+    dpg.add_mouse_wheel_handler(callback=_on_mouse_wheel)
+    dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Middle, callback=_on_middle_down)
+    dpg.add_mouse_release_handler(button=dpg.mvMouseButton_Middle, callback=_on_middle_up)
+    dpg.add_mouse_move_handler(callback=_on_mouse_move)
+
 
 dpg.show_viewport()
 resize_callback()

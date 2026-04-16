@@ -7,6 +7,20 @@ import numpy as np
 from PIL import Image
 
 
+def get_max_tile_size(tiles_dir):
+    """Return the largest dimension (px) across all tile PNGs in the directory."""
+    files = [f for f in os.listdir(tiles_dir) if f.endswith(".png")]
+    if not files:
+        return 20  # sensible fallback
+    max_dim = 0
+    for fname in files:
+        img = Image.open(os.path.join(tiles_dir, fname))
+        w, h = img.size
+        img.close()
+        max_dim = max(max_dim, w, h)
+    return max_dim
+
+
 def load_tile_templates(tiles_dir, tessera_size):
     """Load tile PNGs, resize to tessera_size, extract luminance + alpha.
 

@@ -23,6 +23,9 @@ from PIL import Image
 
 from mosaic import (
     load_tile_templates,
+    get_max_tile_size,
+    quantize_colors,
+    apply_color_influence,
     generate_report,
     build_mosaic_drift,
     build_mosaic_contour,
@@ -42,12 +45,18 @@ def main():
                         help="Placement mode (drift=opus tessellatum, contour=opus vermiculatum, flow=opus musivum)")
     parser.add_argument("--flow-direction", choices=["along", "across"], default="along",
                         help="Flow mode: streamlines follow edges (along) or cross them (across)")
-    parser.add_argument("--tessera-size", type=int, default=30,
-                        help="Base tessera size in output pixels")
+    parser.add_argument("--tesserae-across", type=int, default=50,
+                        help="Number of tesserae across the mosaic width")
+    parser.add_argument("--render-percentage", type=int, default=100,
+                        help="Render at this %% of max tile resolution (10-100)")
     parser.add_argument("--grout-width", type=int, default=-1,
                         help="Grout width in pixels (0=touch, negative=overlap)")
     parser.add_argument("--grout-color", type=int, nargs=3, default=[40, 40, 40],
                         help="Grout RGB color")
+    parser.add_argument("--num-colors", type=int, default=0,
+                        help="Limit palette to N colors (1-128, 0=unlimited)")
+    parser.add_argument("--color-influence", type=float, default=1.0,
+                        help="How much color from the image (0=white, 1=full color)")
     parser.add_argument("--color-variation", type=float, default=15.0,
                         help="Random color jitter range")
     parser.add_argument("--rotation-jitter", type=float, default=3.0,
@@ -58,8 +67,6 @@ def main():
                         help="Real-world tessera size in mm")
     parser.add_argument("--real-grout-mm", type=float, default=1.0,
                         help="Real-world grout width in mm")
-    parser.add_argument("--max-input-size", type=int, default=500,
-                        help="Downsample input if larger than this")
     parser.add_argument("--drift-correction", type=int, default=0,
                         help="Correct drift every N pixels (0=never)")
     parser.add_argument("--edge-threshold", type=float, default=0.15,
@@ -92,37 +99,55 @@ def main():
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
     print(f"Input size: {img_rgb.shape[1]} x {img_rgb.shape[0]} px")
 
-    # Downsample if needed
+    # Resample input to tesserae grid dimensions
     h, w = img_rgb.shape[:2]
-    max_dim = max(h, w)
-    if max_dim > args.max_input_size:
-        scale = args.max_input_size / max_dim
-        new_w, new_h = int(w * scale), int(h * scale)
-        img_rgb = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        print(f"Downsampled to: {new_w} x {new_h} px")
+    tesserae_across = args.tesserae_across
+    if tesserae_across > 500:
+        total_est = tesserae_across * round(tesserae_across * h / w)
+        print(f"WARNING: {tesserae_across} tesserae across (~{total_est:,} total) — this may use a lot of memory and take a long time.")
+    tesserae_down = max(1, round(tesserae_across * h / w))
+    img_rgb = cv2.resize(img_rgb, (tesserae_across, tesserae_down), interpolation=cv2.INTER_AREA)
+    print(f"Mosaic grid: {tesserae_across} x {tesserae_down} tesserae")
+
+    # Color preprocessing: quantize palette, then apply influence
+    if args.num_colors > 0:
+        n = max(1, min(128, args.num_colors))
+        img_rgb = quantize_colors(img_rgb, n)
+        print(f"Palette quantized to {n} colors")
+    influence = max(0.0, min(1.0, args.color_influence))
+    if influence < 1.0:
+        img_rgb = apply_color_influence(img_rgb, influence)
+        print(f"Color influence: {influence:.0%}")
+
+    # Compute effective tessera pixel size from tile resolution and render percentage
+    max_tile_px = get_max_tile_size(args.tiles_dir)
+    render_pct = max(10, min(100, args.render_percentage))
+    effective_tessera_px = max(3, int(max_tile_px * render_pct / 100))
+    effective_grout = round(args.grout_width * render_pct / 100)
+    print(f"Tile resolution ceiling: {max_tile_px}px, render {render_pct}% -> tessera {effective_tessera_px}px")
 
     # Load tile templates
     print(f"Loading tile templates from {args.tiles_dir}...")
-    templates = load_tile_templates(args.tiles_dir, args.tessera_size)
+    templates = load_tile_templates(args.tiles_dir, effective_tessera_px)
 
     # Build mosaic
     print(f"Rendering mosaic (mode: {args.mode})...")
     if args.mode == "drift":
         mosaic, count = build_mosaic_drift(
-            img_rgb, templates, args.tessera_size, args.grout_width,
+            img_rgb, templates, effective_tessera_px, effective_grout,
             args.grout_color, args.color_variation, args.size_jitter,
             args.rotation_jitter, args.drift_correction, rng
         )
     elif args.mode == "contour":
         mosaic, count = build_mosaic_contour(
-            img_rgb, templates, args.tessera_size, args.grout_width,
+            img_rgb, templates, effective_tessera_px, effective_grout,
             args.grout_color, args.color_variation, args.size_jitter,
             args.rotation_jitter, args.edge_threshold, rng,
             fill_style=args.fill_style
         )
     elif args.mode == "flow":
         mosaic, count = build_mosaic_flow(
-            img_rgb, templates, args.tessera_size, args.grout_width,
+            img_rgb, templates, effective_tessera_px, effective_grout,
             args.grout_color, args.color_variation, args.size_jitter,
             args.rotation_jitter, rng,
             flow_direction=args.flow_direction
@@ -139,7 +164,7 @@ def main():
     # Report
     report = generate_report(
         args.image, img_rgb.shape, mosaic.shape, count,
-        args.tessera_size, args.grout_width,
+        effective_tessera_px, effective_grout,
         args.real_tessera_mm, args.real_grout_mm, args.mode
     )
     report_path = os.path.splitext(args.output)[0] + "_report.txt"

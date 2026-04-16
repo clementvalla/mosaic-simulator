@@ -10,20 +10,23 @@ A mosaic simulator that converts images into realistic mosaic renderings. It sim
 
 **CLI (full render):**
 ```bash
-python simulate_mosaic_v2.py --image inputs/photo.jpg --mode drift
-python simulate_mosaic_v2.py --image inputs/photo.jpg --mode contour --fill-style radial
-python simulate_mosaic_v2.py --image inputs/photo.jpg --mode flow --flow-direction across
+python3 simulate_mosaic_v2.py --image inputs/photo.jpg --mode drift --tesserae-across 60
+python3 simulate_mosaic_v2.py --image inputs/photo.jpg --mode contour --tesserae-across 40 --fill-style radial
+python3 simulate_mosaic_v2.py --image inputs/photo.jpg --mode flow --tesserae-across 80 --flow-direction across
+python3 simulate_mosaic_v2.py --image inputs/photo.jpg --mode drift --tesserae-across 100 --render-percentage 50
 ```
+
+Key sizing args: `--tesserae-across N` (number of tesserae across, default 50) and `--render-percentage P` (10-100, percentage of max tile resolution, default 100). Output pixel size is automatically derived from tile template resolution × render percentage.
 
 **GUI (Dear PyGui):**
 ```bash
-python mosaic_gui.py
+python3 mosaic_gui.py
 ```
 
 **Tile extraction (from a photo of a real mosaic):**
 ```bash
-python extract_tiles.py --image images/crop.jpg
-python extract_tiles.py --image images/crop.jpg --preview-only  # inspect before full extraction
+python3 extract_tiles.py --image images/crop.jpg
+python3 extract_tiles.py --image images/crop.jpg --preview-only  # inspect before full extraction
 ```
 
 Output goes to `output/` (auto-named with mode and timestamp). Reports are saved as `_report.txt` alongside each output image.
@@ -38,7 +41,7 @@ Entry points: `simulate_mosaic_v2.py` (CLI), `mosaic_gui.py` (Dear PyGui GUI). B
 
 ### `mosaic/` package
 
-- **tiles.py** — Loads tile template PNGs from `tiles/raw/`, normalizes to (luminance, alpha) pairs. Luminance is normalized so mean over opaque region ≈ 1.0, then multiplied by target color at compositing time.
+- **tiles.py** — `get_max_tile_size()` scans tile PNGs to find the native resolution ceiling. `load_tile_templates()` loads tile template PNGs from `tiles/raw/`, normalizes to (luminance, alpha) pairs. Luminance is normalized so mean over opaque region ≈ 1.0, then multiplied by target color at compositing time.
 - **compositing.py** — Core rendering: `composite_tessera()` blends a luminance×color tile with alpha onto the canvas. `composite_tessera_preview()` draws fast rotated rectangles (no texture) for preview mode. `sample_color_nearest()` maps output position back to input pixel color.
 - **mode_drift.py** — *Opus Tessellatum*: Row-by-row placement with height map for vertical packing. Each tessera maps to one input pixel. Includes edge-fill pass to extend short rows.
 - **mode_contour.py** — *Opus Vermiculatum*: Detects edges via Canny, chains tesserae along contour paths with echo rows on both sides. Background filled with drift rows or flow-field streamlines (radial/concentric).
