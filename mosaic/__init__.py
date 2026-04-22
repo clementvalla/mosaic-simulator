@@ -7,7 +7,8 @@ Modes:
 """
 
 from .tiles import load_tile_templates, get_max_tile_size
-from .compositing import quantize_colors, apply_color_influence, sample_color_nearest, resize_template, composite_tessera, composite_tessera_preview
+from .compositing import quantize_colors, apply_color_influence, sample_color_nearest, resize_template, composite_tessera, composite_tessera_preview, crop_to_content
+from .placements import Placement, render_placements, rasterize_placements
 from .report import generate_report
 from .mode_drift import build_mosaic_drift
 from .mode_contour import build_mosaic_contour
@@ -22,6 +23,10 @@ __all__ = [
     "resize_template",
     "composite_tessera",
     "composite_tessera_preview",
+    "crop_to_content",
+    "Placement",
+    "render_placements",
+    "rasterize_placements",
     "generate_report",
     "build_mosaic_drift",
     "build_mosaic_contour",

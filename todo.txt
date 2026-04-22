@@ -1,5 +1,20 @@
 TODO
+- choose grout (background) color?
+- set default rotation much lower (0.5)
 
-[ ] interface with variables and mode selection, loading and saving images
-[ ] save time it took to process in the info txt it saves with each image
-[ ] refactor (file is getting large)
+
+
+
+Mosaic Simulation Report
+========================================
+Mode: contour
+Input image: gui_input
+Mosaic grid: 65 x 87 tesserae
+Total tesserae: 5,774
+
+Tessera size: 24 px, 10mm, 0.39 inches (output)
+Output dimensions px: 1608 x 2136 px
+Output dimensions mm: 3000 x 4000 mm
+Output dimensions in: 30 x 40 in
+
+

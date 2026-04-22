@@ -19,6 +19,7 @@ from mosaic import (
     build_mosaic_drift,
     build_mosaic_contour,
     build_mosaic_flow,
+    rasterize_placements,
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,6 +38,10 @@ input_image = None      # numpy RGB float32
 output_image = None     # numpy RGB uint8
 showing_output = False
 busy = False
+
+# Preview-placement cache — populated after a successful preview, consumed
+# by the next render click if the params are unchanged.
+_preview_cache = None   # dict: {key, placements, plan_info, tessera_size, grout_color}
 
 _tex_counter = 0        # incremented each time we need a new texture size
 _cur_tex_tag = None     # tag of the currently active texture
@@ -131,7 +136,7 @@ def set_status(text):
 
 def on_file_selected(sender, app_data):
     """Callback when user picks a file from the file dialog."""
-    global input_image
+    global input_image, _preview_cache
     selections = app_data.get("selections", {})
     if selections:
         path = list(selections.values())[0]
@@ -144,13 +149,14 @@ def on_file_selected(sender, app_data):
         set_status(f"Failed to load: {os.path.basename(path)}")
         return
     input_image = img.astype(np.float32)
+    _preview_cache = None
     _reset_zoom_state()
     update_texture(img)
     set_status(f"Loaded: {os.path.basename(path)} ({img.shape[1]}x{img.shape[0]})")
 
 
-def _get_fill_style():
-    val = dpg.get_value("fill_style")
+def _get_combo_fill(tag):
+    val = dpg.get_value(tag)
     if isinstance(val, str):
         return val
     return ["drift", "radial", "concentric"][val]
@@ -165,7 +171,7 @@ def _get_flow_direction():
 
 def run_generate(preview=False):
     """Run mosaic generation (called in a thread)."""
-    global output_image, busy
+    global output_image, busy, _preview_cache
     if input_image is None:
         set_status("No image loaded.")
         return
@@ -189,46 +195,102 @@ def run_generate(preview=False):
         seed_val = int(dpg.get_value("seed_val"))
         drift_correction = int(dpg.get_value("drift_correction"))
         edge_threshold = dpg.get_value("edge_threshold")
-        fill_style = _get_fill_style()
+        inner_fill_style = _get_combo_fill("inner_fill_style")
+        outer_fill_style = _get_combo_fill("outer_fill_style")
         flow_direction = _get_flow_direction()
+        inner_rows = int(dpg.get_value("inner_rows"))
+        outer_rows = int(dpg.get_value("outer_rows"))
 
         # Resample input to tesserae grid dimensions
         h, w = img_rgb.shape[:2]
         tesserae_down = max(1, round(tesserae_across * h / w))
         img_rgb = cv2.resize(img_rgb, (tesserae_across, tesserae_down), interpolation=cv2.INTER_AREA)
 
-        # Color preprocessing: quantize palette, then apply influence
+        # Color preprocessing: separate color image for tessera coloring only
+        # (does NOT affect edge detection, structure tensor, or placement)
+        color_img = img_rgb
         if num_colors > 0:
-            img_rgb = quantize_colors(img_rgb, max(1, min(128, num_colors)))
+            color_img = quantize_colors(color_img, max(1, min(128, num_colors)))
         if color_influence < 1.0:
-            img_rgb = apply_color_influence(img_rgb, max(0.0, color_influence))
+            color_img = apply_color_influence(color_img, max(0.0, color_influence))
 
         # Compute effective tessera px from tile resolution and render %
         effective_tessera_px = max(3, int(MAX_TILE_PX * render_pct / 100))
         effective_grout = round(grout_width_base * render_pct / 100)
 
-        templates = None if preview else load_tile_templates(TILES_DIR, effective_tessera_px)
         rng = np.random.default_rng(seed_val if seed_val != 0 else None)
         grout_color = [40, 40, 40]
 
-        if mode_key == "drift":
-            mosaic, count = build_mosaic_drift(
-                img_rgb, templates, effective_tessera_px, effective_grout, grout_color,
-                color_variation, size_jitter, rotation_jitter, drift_correction, rng,
-                preview=preview,
+        # Cache key: every param that can affect the placement list.
+        # color_variation is deliberately excluded — it's applied at render
+        # time and does NOT change the placement positions/sizes/colors.
+        cache_key = (
+            id(input_image), mode_key,
+            tesserae_across, render_pct, seed_val,
+            grout_width_base, size_jitter, rotation_jitter,
+            num_colors, color_influence,
+            drift_correction, edge_threshold,
+            inner_rows, outer_rows,
+            inner_fill_style, outer_fill_style,
+            flow_direction,
+        )
+
+        cache_hit = (not preview
+                     and _preview_cache is not None
+                     and _preview_cache["key"] == cache_key)
+
+        if cache_hit:
+            set_status("Rendering from cached preview...")
+            templates = load_tile_templates(TILES_DIR, effective_tessera_px)
+            plan_info = _preview_cache["plan_info"]
+            mosaic = rasterize_placements(
+                _preview_cache["placements"],
+                plan_info["canvas_shape"],
+                _preview_cache["grout_color"],
+                _preview_cache["tessera_size"],
+                templates, color_variation, rng,
+                preview=False,
+                crop=plan_info["crop"],
+                fixed_shape=plan_info["fixed_shape"],
             )
-        elif mode_key == "contour":
-            mosaic, count = build_mosaic_contour(
-                img_rgb, templates, effective_tessera_px, effective_grout, grout_color,
-                color_variation, size_jitter, rotation_jitter, edge_threshold, rng,
-                fill_style=fill_style, preview=preview,
-            )
-        elif mode_key == "flow":
-            mosaic, count = build_mosaic_flow(
-                img_rgb, templates, effective_tessera_px, effective_grout, grout_color,
-                color_variation, size_jitter, rotation_jitter, rng,
-                flow_direction=flow_direction, preview=preview,
-            )
+            count = len(_preview_cache["placements"])
+            tag = "[render ♺]"
+        else:
+            templates = None if preview else load_tile_templates(TILES_DIR, effective_tessera_px)
+            if mode_key == "drift":
+                mosaic, count, placements, plan_info = build_mosaic_drift(
+                    img_rgb, templates, effective_tessera_px, effective_grout, grout_color,
+                    color_variation, size_jitter, rotation_jitter, drift_correction, rng,
+                    preview=preview, color_image=color_img,
+                )
+            elif mode_key == "contour":
+                mosaic, count, placements, plan_info = build_mosaic_contour(
+                    img_rgb, templates, effective_tessera_px, effective_grout, grout_color,
+                    color_variation, size_jitter, rotation_jitter, edge_threshold, rng,
+                    preview=preview, color_image=color_img,
+                    inner_rows=inner_rows, outer_rows=outer_rows,
+                    inner_fill_style=inner_fill_style,
+                    outer_fill_style=outer_fill_style,
+                )
+            elif mode_key == "flow":
+                mosaic, count, placements, plan_info = build_mosaic_flow(
+                    img_rgb, templates, effective_tessera_px, effective_grout, grout_color,
+                    color_variation, size_jitter, rotation_jitter, rng,
+                    flow_direction=flow_direction, preview=preview, color_image=color_img,
+                )
+
+            if preview:
+                _preview_cache = {
+                    "key": cache_key,
+                    "placements": placements,
+                    "plan_info": plan_info,
+                    "tessera_size": effective_tessera_px,
+                    "grout_color": grout_color,
+                }
+            else:
+                # A cold full render invalidates any stale preview cache.
+                _preview_cache = None
+            tag = "[preview]" if preview else "[render]"
 
         output_image = mosaic.astype(np.uint8)
         _reset_zoom_state()
@@ -239,7 +301,6 @@ def run_generate(preview=False):
             effective_tessera_px, effective_grout, 10.0, 1.0, mode_key,
         )
         dpg.set_value("report_text", report)
-        tag = "[preview]" if preview else "[render]"
         set_status(f"{tag} {count} tesserae ({tesserae_across}x{tesserae_down}), {mosaic.shape[1]}x{mosaic.shape[0]}px")
 
     except Exception as e:
@@ -399,7 +460,7 @@ with dpg.window(
     # Tessera
     if dpg.add_collapsing_header(label="Tessera", default_open=True):
         dpg.add_slider_int(tag="grout_width", label="Grout", default_value=-1,
-                           min_value=-10, max_value=20, width=-90)
+                           min_value=-5, max_value=20, width=-90)
         dpg.add_slider_float(tag="size_jitter", label="Size Jitter", default_value=0.15,
                              min_value=0.0, max_value=0.5, format="%.2f", width=-90)
         dpg.add_slider_float(tag="rotation_jitter", label="Rotation", default_value=3.0,
@@ -423,16 +484,22 @@ with dpg.window(
         with dpg.group(tag="grp_contour", show=False):
             dpg.add_slider_float(tag="edge_threshold", label="Edge Thresh", default_value=0.15,
                                  min_value=0.0, max_value=1.0, format="%.2f", width=-90)
+            dpg.add_slider_int(tag="inner_rows", label="Inner Rows", default_value=2,
+                               min_value=0, max_value=10, width=-90)
+            dpg.add_slider_int(tag="outer_rows", label="Outer Rows", default_value=2,
+                               min_value=0, max_value=10, width=-90)
             dpg.add_combo(["drift", "radial", "concentric"], default_value="drift",
-                          tag="fill_style", label="Fill Style", width=-90)
+                          tag="inner_fill_style", label="Inner Fill", width=-90)
+            dpg.add_combo(["drift", "radial", "concentric"], default_value="drift",
+                          tag="outer_fill_style", label="Outer Fill", width=-90)
         with dpg.group(tag="grp_flow", show=False):
             dpg.add_combo(["along", "across"], default_value="along",
                           tag="flow_direction", label="Flow Dir", width=-90)
 
     # Report
-    if dpg.add_collapsing_header(label="Report", default_open=False):
+    if dpg.add_collapsing_header(label="Report", default_open=True):
         dpg.add_input_text(tag="report_text", multiline=True, readonly=True,
-                           height=120, width=-1)
+                           height=220, width=-1)
 
 # ── Viewport setup ──
 

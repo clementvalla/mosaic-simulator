@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Simulate a mosaic with realistic placement logic (drift, variable sizing).
+"""Simulate a mosaic with realistic placement logic.
 
-V2 of the mosaic simulator. Instead of a perfect pixel grid, tesserae have
-slightly randomized sizes and accumulate positional drift, mimicking real
-opus tessellatum construction.
+Tesserae have slightly randomized sizes and accumulate positional drift,
+mimicking real opus tessellatum construction.
 
 Three placement modes:
     drift   — Opus Tessellatum (row-by-row with cumulative drift)
@@ -35,7 +34,7 @@ from mosaic import (
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Simulate mosaic with realistic placement (V2)")
+        description="Simulate mosaic with realistic placement")
     parser.add_argument("--image", default="inputs/doodle_xs.jpg", help="Input image path")
     parser.add_argument("--output", default=None,
                         help="Output image path (default: auto-named in output/)")
@@ -73,7 +72,17 @@ def main():
                         help="Edge strength threshold for contour mode (0-1)")
     parser.add_argument("--fill-style", choices=["drift", "radial", "concentric"],
                         default="drift",
-                        help="Background fill for contour mode (drift=rows, radial=radiating outward, concentric=parallel echoes)")
+                        help="Background fill for contour mode (drift=rows, radial=radiating outward, concentric=parallel echoes). Shortcut: sets both inner and outer fill when they aren't overridden.")
+    parser.add_argument("--inner-fill-style", choices=["drift", "radial", "concentric"],
+                        default=None,
+                        help="Contour mode: fill style used inside detected shapes (overrides --fill-style for the inside)")
+    parser.add_argument("--outer-fill-style", choices=["drift", "radial", "concentric"],
+                        default=None,
+                        help="Contour mode: fill style used outside detected shapes (overrides --fill-style for the outside)")
+    parser.add_argument("--inner-rows", type=int, default=2,
+                        help="Contour mode: echo rows on the inner side of each contour")
+    parser.add_argument("--outer-rows", type=int, default=2,
+                        help="Contour mode: echo rows on the outer side of each contour")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     args = parser.parse_args()
 
@@ -109,14 +118,16 @@ def main():
     img_rgb = cv2.resize(img_rgb, (tesserae_across, tesserae_down), interpolation=cv2.INTER_AREA)
     print(f"Mosaic grid: {tesserae_across} x {tesserae_down} tesserae")
 
-    # Color preprocessing: quantize palette, then apply influence
+    # Color preprocessing: build a separate color image for tessera coloring only
+    # (does NOT affect edge detection, structure tensor, or placement)
+    color_img = img_rgb
     if args.num_colors > 0:
         n = max(1, min(128, args.num_colors))
-        img_rgb = quantize_colors(img_rgb, n)
+        color_img = quantize_colors(color_img, n)
         print(f"Palette quantized to {n} colors")
     influence = max(0.0, min(1.0, args.color_influence))
     if influence < 1.0:
-        img_rgb = apply_color_influence(img_rgb, influence)
+        color_img = apply_color_influence(color_img, influence)
         print(f"Color influence: {influence:.0%}")
 
     # Compute effective tessera pixel size from tile resolution and render percentage
@@ -133,24 +144,28 @@ def main():
     # Build mosaic
     print(f"Rendering mosaic (mode: {args.mode})...")
     if args.mode == "drift":
-        mosaic, count = build_mosaic_drift(
+        mosaic, count, _placements, _plan = build_mosaic_drift(
             img_rgb, templates, effective_tessera_px, effective_grout,
             args.grout_color, args.color_variation, args.size_jitter,
-            args.rotation_jitter, args.drift_correction, rng
+            args.rotation_jitter, args.drift_correction, rng,
+            color_image=color_img,
         )
     elif args.mode == "contour":
-        mosaic, count = build_mosaic_contour(
+        mosaic, count, _placements, _plan = build_mosaic_contour(
             img_rgb, templates, effective_tessera_px, effective_grout,
             args.grout_color, args.color_variation, args.size_jitter,
             args.rotation_jitter, args.edge_threshold, rng,
-            fill_style=args.fill_style
+            fill_style=args.fill_style, color_image=color_img,
+            inner_rows=args.inner_rows, outer_rows=args.outer_rows,
+            inner_fill_style=args.inner_fill_style,
+            outer_fill_style=args.outer_fill_style,
         )
     elif args.mode == "flow":
-        mosaic, count = build_mosaic_flow(
+        mosaic, count, _placements, _plan = build_mosaic_flow(
             img_rgb, templates, effective_tessera_px, effective_grout,
             args.grout_color, args.color_variation, args.size_jitter,
             args.rotation_jitter, rng,
-            flow_direction=args.flow_direction
+            flow_direction=args.flow_direction, color_image=color_img,
         )
 
     # Save output

@@ -6,34 +6,26 @@ tessellatum construction.
 
 import time
 
-import cv2
 import numpy as np
 
-from .compositing import composite_tessera, composite_tessera_preview, resize_template, sample_color_nearest
+from .compositing import sample_color_nearest, jitter_size
+from .placements import Placement, render_placements
 
 
-def build_mosaic_drift(input_image, templates, tessera_size, grout_width,
-                       grout_color, color_variation, size_jitter,
-                       rotation_jitter, drift_correction_interval, rng,
-                       preview=False):
-    """Build mosaic with row-by-row placement and cumulative drift.
+def _plan_drift(input_image, color_image, tessera_size, grout_width,
+                size_jitter, rotation_jitter, rng):
+    """Run the drift placement logic and return (placements, canvas_shape).
 
-    Each tessera maps to exactly one input pixel (nearest-neighbor, no
-    interpolation). Tessera sizes are jittered, causing positional drift.
-    Every drift_correction_interval pixels, the cursor nudges back toward
-    the nominal grid position.
+    No canvas is painted here — this function only decides where each
+    tessera goes.
     """
     in_h, in_w = input_image.shape[:2]
-    n_templates = len(templates) if templates else 0
-
-    # Scale: nominal canvas pixels per input pixel
     nominal_cell = tessera_size + grout_width
 
-    # Allocate canvas with headroom for drift
+    # Allocate canvas shape with headroom for drift
     headroom = 1.15
     est_w = int(in_w * nominal_cell * headroom) + tessera_size
     est_h = int(in_h * nominal_cell * headroom) + tessera_size
-    canvas = np.full((est_h, est_w, 3), grout_color, dtype=np.float32)
 
     # Pre-compute rotation angles for jitter
     if rotation_jitter > 0:
@@ -41,19 +33,12 @@ def build_mosaic_drift(input_image, templates, tessera_size, grout_width,
     else:
         rot_angles = [0.0]
 
-    t_start = time.time()
-    max_x_extent = 0
-    total_placed = 0
-    total_pixels = in_h * in_w
-
-    # Height map: tracks the bottom Y of the lowest tessera at each X column
+    grout_gap = max(grout_width, -5)
     height_map = np.zeros(est_w, dtype=np.float64)
-
-    # Effective grout for spacing (allow negative = overlap)
-    grout_gap = max(grout_width, -tessera_size // 3)  # clamp to prevent extreme overlap
-
-    # Track row end positions for edge fill
+    max_x_extent = 0
     row_end_x = []  # (cursor_x_end, edge_color) per row
+    placements = []
+    t_start = time.time()
 
     for row in range(in_h):
         if row % 20 == 0 and row > 0:
@@ -61,18 +46,12 @@ def build_mosaic_drift(input_image, templates, tessera_size, grout_width,
             pct = row / in_h * 100
             print(f"  Row {row}/{in_h} ({pct:.0f}%) - {elapsed:.1f}s elapsed")
 
-        # Snapshot height map so all tesserae in this row use the same Y reference
         row_height_snap = height_map.copy()
         cursor_x = 0
 
         for col in range(in_w):
-            # Jitter tessera size
-            jw = max(int(tessera_size * rng.uniform(1 - size_jitter, 1 + size_jitter)),
-                     int(tessera_size * 0.7))
-            jh = max(int(tessera_size * rng.uniform(1 - size_jitter, 1 + size_jitter)),
-                     int(tessera_size * 0.7))
+            jw, jh = jitter_size(tessera_size, size_jitter, rng)
 
-            # Find Y from height map snapshot: highest point in the X footprint
             x_start = max(cursor_x, 0)
             x_end = min(cursor_x + jw, est_w)
             if x_end > x_start:
@@ -81,48 +60,29 @@ def build_mosaic_drift(input_image, templates, tessera_size, grout_width,
                 y_pos = 0
             y_pos = max(y_pos, 0)
 
-            # Color from exact input pixel (no interpolation)
-            color = sample_color_nearest(input_image, row, col)
-
-            # Rotation angle
+            color = sample_color_nearest(color_image, row, col)
             angle = rng.choice(rot_angles) if rotation_jitter > 0 else 0.0
 
-            if preview:
-                composite_tessera_preview(
-                    canvas, color, cursor_x + jw // 2, y_pos + jh // 2,
-                    jw, jh, angle, color_variation, rng)
-            else:
-                t_idx = rng.integers(n_templates)
-                lum_base, alpha_base = templates[t_idx]
-                lum, alpha = resize_template(lum_base, alpha_base, jw, jh)
-                if abs(angle) > 0.1:
-                    center = (jw / 2, jh / 2)
-                    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                    lum = cv2.warpAffine(lum, M, (jw, jh))
-                    alpha = cv2.warpAffine(alpha, M, (jw, jh))
-                composite_tessera(canvas, lum, alpha, color, cursor_x, y_pos,
-                                  color_variation, rng)
-            total_placed += 1
+            placements.append(Placement(
+                x=cursor_x, y=y_pos, w=jw, h=jh,
+                angle=float(angle), color=color,
+            ))
 
-            # Update height map
             if x_end > x_start:
                 height_map[x_start:x_end] = np.maximum(
-                    height_map[x_start:x_end], y_pos + jh
-                )
+                    height_map[x_start:x_end], y_pos + jh)
 
             cursor_x += jw + grout_gap
 
-        # Record for edge fill
-        edge_color = sample_color_nearest(input_image, row, in_w - 1)
+        edge_color = sample_color_nearest(color_image, row, in_w - 1)
         row_end_x.append((cursor_x, edge_color))
         max_x_extent = max(max_x_extent, cursor_x)
 
     # Edge-fill pass: extend short rows to max_x_extent
-    fill_placed = 0
+    fill_count = 0
     for (rx, edge_col) in row_end_x:
         while rx < max_x_extent:
-            jw = max(int(tessera_size * rng.uniform(1 - size_jitter, 1 + size_jitter)),
-                     int(tessera_size * 0.7))
+            jw, _ = jitter_size(tessera_size, size_jitter, rng)
 
             x_start = max(rx, 0)
             x_end = min(rx + jw, est_w)
@@ -132,47 +92,66 @@ def build_mosaic_drift(input_image, templates, tessera_size, grout_width,
                 y_pos = 0
             y_pos = max(y_pos, 0)
 
-            jh = max(int(tessera_size * rng.uniform(1 - size_jitter, 1 + size_jitter)),
-                     int(tessera_size * 0.7))
-
+            _, jh = jitter_size(tessera_size, size_jitter, rng)
             angle = rng.choice(rot_angles) if rotation_jitter > 0 else 0.0
 
-            if preview:
-                composite_tessera_preview(
-                    canvas, edge_col, rx + jw // 2, y_pos + jh // 2,
-                    jw, jh, angle, color_variation, rng)
-            else:
-                t_idx = rng.integers(n_templates)
-                lum_base, alpha_base = templates[t_idx]
-                lum, alpha = resize_template(lum_base, alpha_base, jw, jh)
-                if abs(angle) > 0.1:
-                    center = (jw / 2, jh / 2)
-                    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                    lum = cv2.warpAffine(lum, M, (jw, jh))
-                    alpha = cv2.warpAffine(alpha, M, (jw, jh))
-                composite_tessera(canvas, lum, alpha, edge_col, rx, y_pos,
-                                  color_variation, rng)
+            placements.append(Placement(
+                x=rx, y=y_pos, w=jw, h=jh,
+                angle=float(angle), color=edge_col,
+            ))
 
             if x_end > x_start:
                 height_map[x_start:x_end] = np.maximum(
-                    height_map[x_start:x_end], y_pos + jh
-                )
+                    height_map[x_start:x_end], y_pos + jh)
 
             rx += jw + grout_gap
-            fill_placed += 1
-            total_placed += 1
+            fill_count += 1
 
-    if fill_placed > 0:
-        print(f"  Edge fill: {fill_placed:,} extra tesserae")
+    if fill_count > 0:
+        print(f"  Edge fill: {fill_count:,} extra tesserae")
 
-    # Crop canvas to actual extent
+    # Final canvas size = fit-to-extent (will be cropped to est_w/est_h)
     final_w = min(max_x_extent + tessera_size, est_w)
     final_h = min(int(height_map[:final_w].max()) + tessera_size, est_h)
+
+    return placements, (est_h, est_w), (final_h, final_w)
+
+
+def build_mosaic_drift(input_image, templates, tessera_size, grout_width,
+                       grout_color, color_variation, size_jitter,
+                       rotation_jitter, drift_correction_interval, rng,
+                       preview=False, color_image=None):
+    """Build mosaic with row-by-row placement and cumulative drift.
+
+    Returns (canvas_uint8, count, placements).
+    """
+    if color_image is None:
+        color_image = input_image
+    in_h, in_w = input_image.shape[:2]
+
+    t_start = time.time()
+
+    placements, (est_h, est_w), (final_h, final_w) = _plan_drift(
+        input_image, color_image, tessera_size, grout_width,
+        size_jitter, rotation_jitter, rng,
+    )
+
+    canvas = np.full((est_h, est_w, 3), grout_color, dtype=np.float32)
+    render_placements(canvas, placements, templates, color_variation, rng,
+                      preview=preview)
+
     canvas = canvas[:final_h, :final_w]
 
     elapsed = time.time() - t_start
+    total_placed = len(placements)
     print(f"Rendering complete: {total_placed:,} tesserae in {elapsed:.1f}s")
-    print(f"Input pixels: {total_pixels:,} | Tesserae placed: {total_placed:,}")
+    print(f"Input pixels: {in_h * in_w:,} | Tesserae placed: {total_placed:,}")
     print(f"Output dimensions: {final_w} x {final_h} px")
 
-    return np.clip(canvas, 0, 255).astype(np.uint8), total_placed
+    plan_info = {
+        "canvas_shape": (est_h, est_w),
+        "crop": "fixed",
+        "fixed_shape": (final_h, final_w),
+    }
+    return (np.clip(canvas, 0, 255).astype(np.uint8),
+            total_placed, placements, plan_info)

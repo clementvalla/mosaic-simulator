@@ -158,6 +158,114 @@ def apply_color_influence(image, influence):
     return image * influence + 255.0 * (1.0 - influence)
 
 
+# ── Constants ──
+
+MIN_SIZE_FACTOR = 0.7       # minimum tessera size as fraction of nominal
+OCCUPANCY_THRESHOLD = 0.25  # skip tessera if footprint is >25% occupied
+ROTATION_JITTER_SCALE = 0.3 # scale factor for rotation jitter
+
+
+def jitter_size(tessera_size, size_jitter, rng):
+    """Return a (jw, jh) pair with random size jitter applied."""
+    min_sz = int(tessera_size * MIN_SIZE_FACTOR)
+    jw = max(int(tessera_size * rng.uniform(1 - size_jitter, 1 + size_jitter)), min_sz)
+    jh = max(int(tessera_size * rng.uniform(1 - size_jitter, 1 + size_jitter)), min_sz)
+    return jw, jh
+
+
+def rotate_tile(lum, alpha, angle):
+    """Rotate luminance and alpha arrays by angle degrees. Returns (lum, alpha)."""
+    if abs(angle) <= 0.1:
+        return lum, alpha
+    h, w = lum.shape[:2]
+    center = (w / 2, h / 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(lum, M, (w, h)), cv2.warpAffine(alpha, M, (w, h))
+
+
+def check_occupancy(occupied_map, x, y, w, h, threshold=OCCUPANCY_THRESHOLD,
+                    grout_gap=0, tessera_size=0):
+    """Return True if the footprint at (x, y, w, h) is too occupied to place.
+
+    When grout_gap is negative, the threshold is raised to allow the expected
+    overlap between adjacent tesserae.
+
+    Returns (blocked, oy0, oy1, ox0, ox1).
+    """
+    # Adjust threshold for expected overlap from negative grout
+    if grout_gap < 0 and tessera_size > 0:
+        overlap_frac = abs(grout_gap) / tessera_size
+        threshold = min(threshold + overlap_frac, 0.75)
+
+    canvas_h, canvas_w = occupied_map.shape
+    oy0 = max(0, y)
+    oy1 = min(canvas_h, y + h)
+    ox0 = max(0, x)
+    ox1 = min(canvas_w, x + w)
+    if oy1 <= oy0 or ox1 <= ox0:
+        return True, oy0, oy1, ox0, ox1
+    footprint = occupied_map[oy0:oy1, ox0:ox1]
+    blocked = footprint.sum() > threshold * footprint.size
+    return blocked, oy0, oy1, ox0, ox1
+
+
+def place_tessera(canvas, occupied_map, px, py, angle, color,
+                  tessera_size, size_jitter, color_variation,
+                  templates, rng, preview=False, center=True, grout_gap=0):
+    """Place one tessera with jitter, rotation, occupancy check, and compositing.
+
+    px, py: placement position.
+    center: if True, (px, py) is center of tessera; if False, top-left.
+    Returns True if placed, False if skipped.
+    """
+    jw, jh = jitter_size(tessera_size, size_jitter, rng)
+
+    if center:
+        tx, ty = px - jw // 2, py - jh // 2
+    else:
+        tx, ty = px, py
+
+    blocked, oy0, oy1, ox0, ox1 = check_occupancy(
+        occupied_map, tx, ty, jw, jh, grout_gap=grout_gap, tessera_size=tessera_size)
+    if blocked:
+        return False, jw, jh
+
+    n_templates = len(templates) if templates else 0
+    if preview:
+        cx_pos = tx + jw // 2 if not center else px
+        cy_pos = ty + jh // 2 if not center else py
+        composite_tessera_preview(canvas, color, cx_pos, cy_pos,
+                                  jw, jh, angle, color_variation, rng)
+    else:
+        t_idx = rng.integers(n_templates)
+        lum, alpha = resize_template(*templates[t_idx], jw, jh)
+        lum, alpha = rotate_tile(lum, alpha, angle)
+        composite_tessera(canvas, lum, alpha, color, tx, ty,
+                          color_variation, rng)
+
+    occupied_map[oy0:oy1, ox0:ox1] = True
+    return True, jw, jh
+
+
+def crop_to_content(canvas, grout_color, margin=0):
+    """Crop canvas to the bounding box of non-grout pixels plus margin."""
+    canvas_h, canvas_w = canvas.shape[:2]
+    grout_arr = np.array(grout_color, dtype=np.float32)
+    diff = np.abs(canvas - grout_arr).sum(axis=2)
+    occupied = diff > 1.0
+    if not occupied.any():
+        return canvas
+    rows_occ = np.any(occupied, axis=1)
+    cols_occ = np.any(occupied, axis=0)
+    r0, r1 = np.argmax(rows_occ), len(rows_occ) - np.argmax(rows_occ[::-1])
+    c0, c1 = np.argmax(cols_occ), len(cols_occ) - np.argmax(cols_occ[::-1])
+    r0 = max(0, r0 - margin)
+    c0 = max(0, c0 - margin)
+    r1 = min(canvas_h, r1 + margin)
+    c1 = min(canvas_w, c1 + margin)
+    return canvas[r0:r1, c0:c1]
+
+
 def sample_color_nearest(input_image, pixel_row, pixel_col):
     """Get the exact color of a specific input pixel (no interpolation)."""
     h, w = input_image.shape[:2]
